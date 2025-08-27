@@ -165,7 +165,12 @@ class QuantumFinanceAssistant:
             'BHARTIARTL': 'BHARTIARTL.NS',
             'HINDUNILVR': 'HINDUNILVR.NS',
             'HCLTECH': 'HCLTECH.NS',
-            'KOTAKBANK': 'KOTAKBANK.NS'
+            'KOTAKBANK': 'KOTAKBANK.NS',
+            'TECHM': 'TECHM.NS',
+            'LT': 'LT.NS',
+            'MARUTI': 'MARUTI.NS',
+            'TATAMOTORS': 'TATAMOTORS.NS',
+            'AXISBANK': 'AXISBANK.NS'
         }
         
         for symbol in symbols:
@@ -189,7 +194,11 @@ class QuantumFinanceAssistant:
             ticker = yf.Ticker(symbol)
             info = ticker.info
             
-            # Format market cap
+            # Handle empty info dictionary
+            if not info or len(info) == 0:
+                return {'Error': f"No information available for {symbol}"}
+            
+            # Format market cap safely
             market_cap = info.get('marketCap', 'N/A')
             if isinstance(market_cap, (int, float)) and market_cap > 0:
                 if market_cap > 1e12:
@@ -198,18 +207,21 @@ class QuantumFinanceAssistant:
                     market_cap = f"${market_cap/1e9:.2f}B"
                 elif market_cap > 1e6:
                     market_cap = f"${market_cap/1e6:.2f}M"
+                else:
+                    market_cap = f"${market_cap:,.0f}"
             
             return {
-                'Name': info.get('longName', 'N/A'),
+                'Name': info.get('longName', info.get('shortName', 'N/A')),
                 'Sector': info.get('sector', 'N/A'),
                 'Industry': info.get('industry', 'N/A'),
                 'Market Cap': market_cap,
                 'Country': info.get('country', 'N/A'),
                 'Currency': info.get('currency', 'USD'),
-                'Exchange': info.get('exchange', 'N/A')
+                'Exchange': info.get('exchange', info.get('market', 'N/A')),
+                'Current Price': info.get('currentPrice', info.get('regularMarketPrice', 'N/A'))
             }
         except Exception as e:
-            return {'Error': f"Could not fetch info: {str(e)}"}
+            return {'Error': f"Could not fetch info for {symbol}: {str(e)}"}
     
     def fetch_market_data(self, symbols, period="1y"):
         """Fetch real market data from Yahoo Finance with improved error handling"""
@@ -221,133 +233,212 @@ class QuantumFinanceAssistant:
             failed_symbols = []
             success_symbols = []
             
+            # Initialize progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
             
             for i, symbol in enumerate(formatted_symbols):
                 try:
-                    status_text.text(f"Fetching data for {symbol}...")
+                    status_text.text(f"Fetching data for {symbol}... ({i+1}/{len(formatted_symbols)})")
                     progress_bar.progress((i + 1) / len(formatted_symbols))
                     
                     ticker = yf.Ticker(symbol)
                     hist = ticker.history(period=period)
                     
-                    if hist.empty or len(hist) < 10:  # Need minimum data points
-                        failed_symbols.append(symbol)
+                    # Validate data quality
+                    if hist.empty:
+                        failed_symbols.append(f"{symbol} (No data)")
+                        continue
+                    
+                    if len(hist) < 10:  # Need minimum data points
+                        failed_symbols.append(f"{symbol} (Insufficient data: {len(hist)} days)")
+                        continue
+                    
+                    # Check for valid close prices
+                    if hist['Close'].isna().all():
+                        failed_symbols.append(f"{symbol} (All NaN values)")
                         continue
                         
                     data[symbol] = hist['Close']
                     success_symbols.append(symbol)
                     
                 except Exception as e:
-                    failed_symbols.append(f"{symbol} ({str(e)})")
+                    failed_symbols.append(f"{symbol} (Error: {str(e)[:50]})")
             
+            # Clear progress indicators
             progress_bar.empty()
             status_text.empty()
             
+            # Display results
             if success_symbols:
                 st.success(f"✅ Successfully loaded data for: {', '.join(success_symbols)}")
             
             if failed_symbols:
                 st.error(f"❌ Failed to load data for: {', '.join(failed_symbols)}")
-                st.info("💡 For Indian stocks, try: TCS, INFY, RELIANCE, HDFCBANK")
+                st.info("💡 Tips: For Indian stocks use TCS, INFY, RELIANCE. For US stocks use AAPL, MSFT, GOOGL")
             
             if not data:
                 st.error("No valid data found for any symbols")
                 return None
                 
+            # Create DataFrame and handle missing values
             df = pd.DataFrame(data)
-            # Remove rows with any NaN values
+            
+            # Show data quality info
+            original_rows = len(df)
             df = df.dropna()
             
             if df.empty:
-                st.error("No overlapping data found for the selected symbols")
+                st.error("No overlapping data found after removing missing values")
                 return None
             
-            st.info(f"📊 Loaded data for {len(data)} assets over {len(df)} trading days")
+            if original_rows - len(df) > 0:
+                st.info(f"Removed {original_rows - len(df)} rows with missing data")
+            
+            st.info(f"📊 Final dataset: {len(df.columns)} assets over {len(df)} trading days")
             return df
             
         except Exception as e:
-            st.error(f"Error fetching market data: {str(e)}")
+            st.error(f"Critical error in data fetching: {str(e)}")
             return None
     
     def calculate_returns_and_risk(self, prices):
         """Calculate returns, volatility, and covariance matrix"""
-        returns = prices.pct_change().dropna()
-        
-        if returns.empty:
-            raise ValueError("No return data available")
-        
-        mean_returns = returns.mean() * 252  # Annualized
-        cov_matrix = returns.cov() * 252  # Annualized
-        return returns, mean_returns, cov_matrix
+        try:
+            returns = prices.pct_change().dropna()
+            
+            if returns.empty:
+                raise ValueError("No return data available after calculating percentage changes")
+            
+            # Check for any infinite or NaN values
+            returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+            
+            if returns.empty:
+                raise ValueError("No valid return data after cleaning")
+            
+            # Annualized calculations
+            mean_returns = returns.mean() * 252
+            cov_matrix = returns.cov() * 252
+            
+            # Validate covariance matrix
+            if cov_matrix.isna().any().any():
+                raise ValueError("Covariance matrix contains NaN values")
+            
+            return returns, mean_returns, cov_matrix
+            
+        except Exception as e:
+            raise ValueError(f"Error in calculating returns and risk: {str(e)}")
     
     def sharpe_ratio(self, weights, mean_returns, cov_matrix):
         """Calculate negative Sharpe ratio for minimization"""
-        portfolio_return = np.sum(mean_returns * weights)
-        portfolio_std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-        
-        if portfolio_std == 0:
-            return -float('inf')
-        
-        return -(portfolio_return - self.risk_free_rate) / portfolio_std
+        try:
+            portfolio_return = np.sum(mean_returns * weights)
+            portfolio_variance = np.dot(weights.T, np.dot(cov_matrix, weights))
+            
+            # Handle negative variance (numerical issues)
+            if portfolio_variance < 0:
+                return float('inf')
+            
+            portfolio_std = np.sqrt(portfolio_variance)
+            
+            if portfolio_std == 0:
+                return float('inf')
+            
+            sharpe = (portfolio_return - self.risk_free_rate) / portfolio_std
+            return -sharpe  # Negative for minimization
+            
+        except Exception:
+            return float('inf')
     
     def simulate_qaoa_optimization(self, mean_returns, cov_matrix, p_layers=3):
-        """Simulate QAOA optimization (hybrid classical-quantum approach)"""
+        """Simulate QAOA optimization with robust error handling"""
         n_assets = len(mean_returns)
         
-        # Constraints: weights sum to 1, all weights >= 0
-        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-        bounds = tuple((0, 1) for _ in range(n_assets))
-        
-        # Initial guess - equal weighting
-        x0 = np.array([1/n_assets] * n_assets)
-        
         try:
-            # Classical optimization
-            result = minimize(
-                self.sharpe_ratio, 
-                x0, 
-                args=(mean_returns, cov_matrix),
-                method='SLSQP',
-                bounds=bounds,
-                constraints=constraints,
-                options={'maxiter': 1000}
-            )
+            # Constraints and bounds
+            constraints = [
+                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+            ]
+            bounds = [(0, 1) for _ in range(n_assets)]
             
-            if not result.success:
-                st.warning("Optimization did not converge perfectly, using best result found")
+            # Multiple starting points for robustness
+            best_result = None
+            best_sharpe = -float('inf')
             
-            # Add quantum "enhancement" simulation (small random perturbation)
-            quantum_noise = np.random.normal(0, 0.005, n_assets)
-            optimized_weights = result.x + quantum_noise
+            starting_points = [
+                np.array([1/n_assets] * n_assets),  # Equal weights
+                np.random.dirichlet(np.ones(n_assets)),  # Random weights
+                np.random.dirichlet(np.ones(n_assets))   # Another random
+            ]
             
-            # Ensure weights are positive and sum to 1
+            for x0 in starting_points:
+                try:
+                    result = minimize(
+                        self.sharpe_ratio, 
+                        x0, 
+                        args=(mean_returns, cov_matrix),
+                        method='SLSQP',
+                        bounds=bounds,
+                        constraints=constraints,
+                        options={'maxiter': 1000, 'ftol': 1e-9}
+                    )
+                    
+                    if result.success and -result.fun > best_sharpe:
+                        best_result = result
+                        best_sharpe = -result.fun
+                        
+                except Exception:
+                    continue
+            
+            if best_result is None:
+                raise ValueError("All optimization attempts failed")
+            
+            # Add quantum "enhancement" simulation
+            quantum_noise = np.random.normal(0, 0.002, n_assets)
+            optimized_weights = best_result.x + quantum_noise
+            
+            # Ensure valid weights
             optimized_weights = np.abs(optimized_weights)
             optimized_weights = optimized_weights / np.sum(optimized_weights)
             
-            return optimized_weights, -result.fun
+            # Verify weights sum to 1
+            if abs(np.sum(optimized_weights) - 1.0) > 1e-6:
+                optimized_weights = optimized_weights / np.sum(optimized_weights)
+            
+            return optimized_weights, best_sharpe
             
         except Exception as e:
-            st.error(f"Optimization failed: {str(e)}")
-            # Return equal weights as fallback
+            st.warning(f"Optimization warning: {str(e)}. Using equal weights as fallback.")
+            # Fallback to equal weights
             equal_weights = np.array([1/n_assets] * n_assets)
-            sharpe = -self.sharpe_ratio(equal_weights, mean_returns, cov_matrix)
-            return equal_weights, sharpe
+            fallback_sharpe = -self.sharpe_ratio(equal_weights, mean_returns, cov_matrix)
+            return equal_weights, fallback_sharpe
     
     def calculate_portfolio_metrics(self, weights, mean_returns, cov_matrix):
-        """Calculate comprehensive portfolio metrics"""
-        portfolio_return = np.sum(mean_returns * weights)
-        portfolio_std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-        sharpe_ratio = (portfolio_return - self.risk_free_rate) / portfolio_std if portfolio_std > 0 else 0
-        
-        return {
-            'Expected Return': portfolio_return,
-            'Volatility': portfolio_std,
-            'Sharpe Ratio': sharpe_ratio,
-            'VaR (95%)': -1.645 * portfolio_std,
-            'Max Drawdown': 0.15  # Simplified calculation
-        }
+        """Calculate comprehensive portfolio metrics with error handling"""
+        try:
+            portfolio_return = np.sum(mean_returns * weights)
+            portfolio_variance = np.dot(weights.T, np.dot(cov_matrix, weights))
+            portfolio_std = np.sqrt(max(0, portfolio_variance))  # Ensure non-negative
+            
+            sharpe_ratio = (portfolio_return - self.risk_free_rate) / portfolio_std if portfolio_std > 0 else 0
+            
+            return {
+                'Expected Return': portfolio_return,
+                'Volatility': portfolio_std,
+                'Sharpe Ratio': sharpe_ratio,
+                'VaR (95%)': -1.645 * portfolio_std,
+                'Max Drawdown': 0.15  # Simplified calculation
+            }
+        except Exception as e:
+            st.error(f"Error calculating portfolio metrics: {str(e)}")
+            return {
+                'Expected Return': 0,
+                'Volatility': 0,
+                'Sharpe Ratio': 0,
+                'VaR (95%)': 0,
+                'Max Drawdown': 0
+            }
 
 # Initialize the assistant
 assistant = QuantumFinanceAssistant()
@@ -364,7 +455,7 @@ with tab1:
     selected_symbols = []
     for category in asset_categories:
         if category in default_symbols:
-            selected_symbols.extend(default_symbols[category][:2])  # Limit to 2 per category
+            selected_symbols.extend(default_symbols[category][:2])
     
     col1, col2 = st.columns([2, 1])
     
@@ -396,21 +487,26 @@ with tab1:
                     with st.expander(f"📊 {symbol} Details"):
                         company_info = assistant.get_company_info(formatted_symbol)
                         for key, value in company_info.items():
-                            st.write(f"**{key}:** {value}")
+                            if key != 'Error':
+                                st.write(f"**{key}:** {value}")
+                            else:
+                                st.error(value)
     
     # Popular stock symbols reference
     with st.expander("🇮🇳 Popular Stock Symbols"):
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("""
-            **Indian IT:** TCS, INFY, WIPRO, HCLTECH  
-            **Indian Banks:** HDFCBANK, ICICIBANK, SBIN, KOTAKBANK  
+            **Indian IT:** TCS, INFY, WIPRO, HCLTECH, TECHM  
+            **Indian Banks:** HDFCBANK, ICICIBANK, SBIN, KOTAKBANK, AXISBANK  
             **Consumer:** HINDUNILVR, ITC, RELIANCE  
+            **Auto:** MARUTI, TATAMOTORS, LT  
             """)
         with col2:
             st.markdown("""
-            **US Tech:** AAPL, MSFT, GOOGL, AMZN, META  
+            **US Tech:** AAPL, MSFT, GOOGL, AMZN, META, NVDA  
             **ETFs:** SPY, QQQ, VTI, BND  
+            **Bonds:** TLT, IEF, LQD, HYG  
             **Others:** Enter any valid ticker symbol  
             """)
     
@@ -442,8 +538,8 @@ with tab1:
                             optimization_method = f"Quantum QAOA ({qaoa_layers} layers, {quantum_shots} shots)"
                         else:
                             # Classical optimization
-                            constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-                            bounds = tuple((0, 1) for _ in range(len(prices.columns)))
+                            constraints = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
+                            bounds = [(0, 1) for _ in range(len(prices.columns))]
                             x0 = np.array([1/len(prices.columns)] * len(prices.columns))
                             
                             result = minimize(
@@ -470,6 +566,7 @@ with tab1:
                         
                     except Exception as e:
                         st.error(f"Error during optimization: {str(e)}")
+                        st.info("Try with different symbols or a longer time period")
                 else:
                     st.error("Failed to fetch valid market data. Please check your symbols and try again.")
 
@@ -543,6 +640,12 @@ if 'optimization_results' in st.session_state:
         st.markdown("## 📊 Portfolio Analysis & Risk Metrics")
         
         try:
+            # Ensure metrics is defined
+            if 'metrics' not in locals():
+                metrics = assistant.calculate_portfolio_metrics(
+                    results['weights'], results['mean_returns'], results['cov_matrix']
+                )
+            
             # Risk-Return Chart
             fig_scatter = go.Figure()
             
@@ -585,7 +688,7 @@ if 'optimization_results' in st.session_state:
             # Historical performance
             st.markdown("### 📈 Historical Price Performance")
             
-            # Normalize prices
+            # Normalize prices to show performance
             normalized_prices = results['prices'] / results['prices'].iloc[0] * 100
             
             fig_lines = go.Figure()
@@ -639,73 +742,3 @@ with tab3:
         1. **Problem Encoding**: Portfolio optimization as QUBO
         2. **Quantum Circuit**: Alternating operator ansatz
         3. **Parameter Optimization**: Classical optimizer
-        4. **Result Extraction**: Measurement and post-processing
-        """)
-    
-    with col2:
-        st.markdown("### 🔧 Technical Implementation")
-        st.code("""
-# QAOA Circuit Structure
-def qaoa_circuit(params, p_layers):
-    # Initialize uniform superposition
-    circuit.h(range(n_qubits))
-    
-    for p in range(p_layers):
-        # Problem Hamiltonian
-        circuit.rzz(params[p], qi, qj)
-        
-        # Mixer Hamiltonian  
-        circuit.rx(params[p + p_layers], qi)
-    
-    return circuit
-        """, language='python')
-
-with tab4:
-    st.markdown("## 📚 Research & Trusted Sources")
-    
-    # Display trusted sources
-    sources = assistant.get_trusted_data_sources()
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("### 🔗 Data Sources")
-        for category, source_list in sources.items():
-            st.markdown(f"**{category}:**")
-            for source in source_list:
-                st.markdown(f"- {source}")
-            st.markdown("")
-    
-    with col2:
-        st.markdown("### 📖 Research Papers")
-        st.markdown("""
-        **Quantum Finance:**
-        - "Quantum algorithms for portfolio optimization" (IBM Research)
-        - "QAOA for Maximum Cut and Max k-Cut" (Farhi et al.)
-        - "Quantum Machine Learning in Finance" (JPMorgan Chase)
-        
-        **Portfolio Theory:**
-        - "Modern Portfolio Theory" (Markowitz, 1952)
-        - "The Sharpe Ratio" (Sharpe, 1966)
-        - "Black-Litterman Model" (Black & Litterman, 1992)
-        """)
-    
-    st.markdown("### ⚠️ Disclaimers")
-    st.warning("""
-    **Important Notes:**
-    - This is a research prototype for educational purposes
-    - Past performance does not guarantee future results
-    - All investments carry risk of loss
-    - Consult with financial advisors before making investment decisions
-    - Quantum algorithms are simulated on classical computers
-    """)
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666;'>
-    <h4>🏆 Amaravati Quantum Valley Hackathon 2025</h4>
-    <p><strong>Team Clashers</strong> | Problem ID: AQVH916 | AI + Quantum Finance Assistant</p>
-    <p>Powered by QAOA, IBM Qiskit, and Streamlit | Built with ❤️ for the future of finance</p>
-</div>
-""", unsafe_allow_html=True)
