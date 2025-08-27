@@ -741,4 +741,4 @@ with tab3:
         **QAOA (Quantum Approximate Optimization Algorithm):**
         1. **Problem Encoding**: Portfolio optimization as QUBO
         2. **Quantum Circuit**: Alternating operator ansatz
-        3. **Parameter Optimization**: Classical optimizer
+        3. **Parameter Optimization**: Classical optimizer""")
